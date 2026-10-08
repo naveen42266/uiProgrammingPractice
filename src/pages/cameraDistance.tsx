@@ -9,6 +9,9 @@ import {
   ShieldCheck,
   Activity,
   Target,
+  Sliders,
+  CheckCircle2,
+  RotateCcw,
 } from 'lucide-react';
 
 interface TyrePreset {
@@ -39,6 +42,20 @@ export default function TyreGuidanceScanner() {
     const saved = localStorage.getItem('tyre_camera_focal_length');
     return saved ? parseFloat(saved) : 650;
   });
+  const [isCalibrated, setIsCalibrated] = useState<boolean>(() => {
+    return !!localStorage.getItem('tyre_camera_focal_length');
+  });
+
+  // Edge Marker Positions (0.0 to 1.0 fraction of viewport width)
+  const [leftEdgeRatio, setLeftEdgeRatio] = useState<number>(0.25);
+  const [rightEdgeRatio, setRightEdgeRatio] = useState<number>(0.75);
+  const [autoEdgeTracking, setAutoEdgeTracking] = useState<boolean>(true);
+  const [draggingHandle, setDraggingHandle] = useState<'left' | 'right' | null>(null);
+
+  // Calibration Form State
+  const [calibrationDistInput, setCalibrationDistInput] = useState<number>(18); // 18 cm sweet spot
+  const [showCalibrationDrawer, setShowCalibrationDrawer] = useState<boolean>(false);
+  const [calibrationSuccess, setCalibrationSuccess] = useState<boolean>(false);
 
   // Camera state
   const [cameraFacing, setCameraFacing] = useState<'environment' | 'user'>('environment');
@@ -55,7 +72,7 @@ export default function TyreGuidanceScanner() {
   const [validRecordedSeconds, setValidRecordedSeconds] = useState<number>(0);
   const [sessionFrameCount, setSessionFrameCount] = useState<number>(0);
 
-  // 1. Initialize Camera Stream (Instant startup, zero ML download)
+  // 1. Initialize Camera Stream
   useEffect(() => {
     let stream: MediaStream | null = null;
     setCameraReady(false);
@@ -79,7 +96,6 @@ export default function TyreGuidanceScanner() {
               setCameraReady(true);
               const savedF = localStorage.getItem('tyre_camera_focal_length');
               if (!savedF && v.videoWidth) {
-                // Approximate standard ~70° HFOV lens: F ≈ width * 0.714
                 const autoF = Math.round(v.videoWidth * 0.714);
                 setFocalLength(autoF);
               }
@@ -122,7 +138,7 @@ export default function TyreGuidanceScanner() {
         gain.connect(ctx.destination);
 
         if (zone === 'IN_RANGE') {
-          // Harmonious High Tone (880 Hz) -> In Green Zone
+          // Harmonious High Tone (880 Hz)
           osc.type = 'sine';
           osc.frequency.setValueAtTime(880, ctx.currentTime);
           gain.gain.setValueAtTime(0.06, ctx.currentTime);
@@ -130,7 +146,7 @@ export default function TyreGuidanceScanner() {
           osc.start();
           osc.stop(ctx.currentTime + 0.12);
         } else if (zone === 'TOO_CLOSE') {
-          // Low Alert Tone (260 Hz) -> Move Back
+          // Low Alert Tone (260 Hz)
           osc.type = 'triangle';
           osc.frequency.setValueAtTime(260, ctx.currentTime);
           gain.gain.setValueAtTime(0.06, ctx.currentTime);
@@ -138,7 +154,7 @@ export default function TyreGuidanceScanner() {
           osc.start();
           osc.stop(ctx.currentTime + 0.15);
         } else if (zone === 'TOO_FAR') {
-          // Medium Chirp (520 Hz) -> Move Closer
+          // Medium Chirp (520 Hz)
           osc.type = 'sine';
           osc.frequency.setValueAtTime(520, ctx.currentTime);
           gain.gain.setValueAtTime(0.04, ctx.currentTime);
@@ -153,7 +169,7 @@ export default function TyreGuidanceScanner() {
     [isAudioEnabled]
   );
 
-  // 3. Real-Time Laplacian Sharpness & Tread Edge Scanner Loop
+  // 3. Real-Time Laplacian Sharpness & Edge Detection Loop
   useEffect(() => {
     if (!cameraReady) return;
 
@@ -172,7 +188,7 @@ export default function TyreGuidanceScanner() {
         const imgData = ctx.getImageData(0, 0, procW, procH);
         const d = imgData.data;
 
-        // A. Laplacian Focus/Sharpness Variance Calculation
+        // Laplacian Focus/Sharpness Variance Calculation
         let sumLap = 0;
         let sumLapSq = 0;
         let count = 0;
@@ -199,52 +215,40 @@ export default function TyreGuidanceScanner() {
           setSharpnessScore(score);
         }
 
-        // B. Horizontal Tread Edge Scan across center band (35% to 65% height)
-        const startY = Math.floor(procH * 0.35);
-        const endY = Math.floor(procH * 0.65);
-        const hSpan = endY - startY;
+        // Automatic Edge Detection (only if auto tracking enabled and not user-dragging)
+        if (autoEdgeTracking && !draggingHandle) {
+          const startY = Math.floor(procH * 0.35);
+          const endY = Math.floor(procH * 0.65);
+          const hSpan = endY - startY;
 
-        const lum = new Float32Array(procW);
-        for (let x = 0; x < procW; x++) {
-          let colSum = 0;
-          for (let y = startY; y < endY; y++) {
-            const idx = (y * procW + x) * 4;
-            colSum += 0.299 * d[idx] + 0.587 * d[idx + 1] + 0.114 * d[idx + 2];
+          const lum = new Float32Array(procW);
+          for (let x = 0; x < procW; x++) {
+            let colSum = 0;
+            for (let y = startY; y < endY; y++) {
+              const idx = (y * procW + x) * 4;
+              colSum += 0.299 * d[idx] + 0.587 * d[idx + 1] + 0.114 * d[idx + 2];
+            }
+            lum[x] = colSum / hSpan;
           }
-          lum[x] = colSum / hSpan;
-        }
 
-        // Scan outward from center to find tyre tread edges
-        const centerX = Math.floor(procW / 2);
-        let leftEdge = centerX;
-        let rightEdge = centerX;
+          const centerX = Math.floor(procW / 2);
+          let leftEdge = centerX;
+          let rightEdge = centerX;
 
-        let totalLum = 0;
-        for (let x = 0; x < procW; x++) totalLum += lum[x];
-        const avgLum = totalLum / procW;
-        const rubberThreshold = Math.min(avgLum * 0.95, 120);
+          let totalLum = 0;
+          for (let x = 0; x < procW; x++) totalLum += lum[x];
+          const avgLum = totalLum / procW;
+          const rubberThreshold = Math.min(avgLum * 0.92, 115);
 
-        while (leftEdge > 8 && lum[leftEdge] < rubberThreshold) leftEdge--;
-        while (rightEdge < procW - 8 && lum[rightEdge] < rubberThreshold) rightEdge++;
+          while (leftEdge > 12 && lum[leftEdge] < rubberThreshold) leftEdge--;
+          while (rightEdge < procW - 12 && lum[rightEdge] < rubberThreshold) rightEdge++;
 
-        const measuredSpanProc = rightEdge - leftEdge;
-        if (measuredSpanProc > 20) {
-          // Scale pixel width to native video resolution
-          const nativeVideoW = v.videoWidth || 1280;
-          const nativePixelWidth = (measuredSpanProc / procW) * nativeVideoW;
-
-          // Rolling median filter to eliminate frame jitter
-          const hist = pixelHistoryRef.current;
-          hist.push(nativePixelWidth);
-          if (hist.length > 12) hist.shift();
-
-          const sorted = [...hist].sort((a, b) => a - b);
-          const medianP = sorted[Math.floor(sorted.length / 2)];
-
-          // Pin-hole Camera Distance Calculation: Distance = (W_real * F) / P
-          const rawDist = (targetWidthCm * focalLength) / medianP;
-          if (!isNaN(rawDist) && isFinite(rawDist)) {
-            setCurrentDistanceCm((prev) => (prev !== null ? prev * 0.75 + rawDist * 0.25 : rawDist));
+          const measuredSpanProc = rightEdge - leftEdge;
+          if (measuredSpanProc > 30) {
+            const rawLeft = leftEdge / procW;
+            const rawRight = rightEdge / procW;
+            setLeftEdgeRatio((prev) => prev * 0.85 + rawLeft * 0.15);
+            setRightEdgeRatio((prev) => prev * 0.85 + rawRight * 0.15);
           }
         }
       }
@@ -253,9 +257,31 @@ export default function TyreGuidanceScanner() {
 
     animId = requestAnimationFrame(processFrame);
     return () => cancelAnimationFrame(animId);
-  }, [cameraReady, targetWidthCm, focalLength]);
+  }, [cameraReady, autoEdgeTracking, draggingHandle]);
 
-  // 4. Compute Guidance Zone (15 to 20 cm Target Window)
+  // 4. Calculate Distance from Active Edge Markers (Visual Overlay)
+  const videoNativeW = videoRef.current?.videoWidth || 1280;
+  const currentPixelSpan = Math.max(10, (rightEdgeRatio - leftEdgeRatio) * videoNativeW);
+
+  useEffect(() => {
+    if (currentPixelSpan > 10) {
+      // Rolling median filter to reject wobble
+      const hist = pixelHistoryRef.current;
+      hist.push(currentPixelSpan);
+      if (hist.length > 10) hist.shift();
+
+      const sorted = [...hist].sort((a, b) => a - b);
+      const medianP = sorted[Math.floor(sorted.length / 2)];
+
+      // Triangle Similarity Formula: Distance = (Real Width * Focal Length) / Pixel Span
+      const dist = (targetWidthCm * focalLength) / medianP;
+      if (!isNaN(dist) && isFinite(dist)) {
+        setCurrentDistanceCm((prev) => (prev !== null ? prev * 0.75 + dist * 0.25 : dist));
+      }
+    }
+  }, [currentPixelSpan, targetWidthCm, focalLength]);
+
+  // 5. Compute Guidance Zone (15 to 20 cm Target Window)
   const currentZone: GuidanceZone =
     currentDistanceCm === null
       ? 'NO_TARGET'
@@ -265,7 +291,7 @@ export default function TyreGuidanceScanner() {
       ? 'IN_RANGE'
       : 'TOO_FAR';
 
-  // Trigger Audio Tone and Mobile Haptics
+  // Trigger Guidance Audio and Mobile Haptics
   useEffect(() => {
     if (currentZone !== 'NO_TARGET') {
       playGuidanceTone(currentZone);
@@ -275,12 +301,11 @@ export default function TyreGuidanceScanner() {
     }
   }, [currentZone, playGuidanceTone]);
 
-  // 5. Smart Auto-Record Gating (Records strictly in 15-20cm & sharp focus)
+  // 6. Smart Auto-Record Gating
   useEffect(() => {
     if (!isSessionActive) return;
 
     const timer = setInterval(() => {
-      // Gate: only accumulates valid footage when within 15 - 20 cm and sharp
       if (currentZone === 'IN_RANGE' && sharpnessScore >= 20) {
         setValidRecordedSeconds((prev) => +(prev + 0.1).toFixed(1));
         setSessionFrameCount((prev) => prev + 3);
@@ -290,9 +315,69 @@ export default function TyreGuidanceScanner() {
     return () => clearInterval(timer);
   }, [isSessionActive, currentZone, sharpnessScore]);
 
-  // Expected pixel width at optimal 17.5 cm target distance for on-screen reticle corridor
+  // Handle Dragging Edge Lines
+  const handlePointerMove = useCallback(
+    (clientX: number) => {
+      if (!draggingHandle || !containerRef.current) return;
+      const rect = containerRef.current.getBoundingClientRect();
+      const currentRatio = Math.max(0.05, Math.min(0.95, (clientX - rect.left) / rect.width));
+
+      if (draggingHandle === 'left') {
+        setLeftEdgeRatio(Math.min(currentRatio, rightEdgeRatio - 0.08));
+      } else if (draggingHandle === 'right') {
+        setRightEdgeRatio(Math.max(currentRatio, leftEdgeRatio + 0.08));
+      }
+    },
+    [draggingHandle, leftEdgeRatio, rightEdgeRatio]
+  );
+
+  useEffect(() => {
+    const onMouseMove = (e: MouseEvent) => handlePointerMove(e.clientX);
+    const onMouseUp = () => setDraggingHandle(null);
+    const onTouchMove = (e: TouchEvent) => {
+      if (e.touches[0]) handlePointerMove(e.touches[0].clientX);
+    };
+    const onTouchEnd = () => setDraggingHandle(null);
+
+    if (draggingHandle) {
+      window.addEventListener('mousemove', onMouseMove);
+      window.addEventListener('mouseup', onMouseUp);
+      window.addEventListener('touchmove', onTouchMove);
+      window.addEventListener('touchend', onTouchEnd);
+    }
+    return () => {
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mouseup', onMouseUp);
+      window.removeEventListener('touchmove', onTouchMove);
+      window.removeEventListener('touchend', onTouchEnd);
+    };
+  }, [draggingHandle, handlePointerMove]);
+
+  // 1-Click Calibration at physical distance (Eliminates focal length error)
+  const handleLockCalibration = () => {
+    if (calibrationDistInput <= 0 || targetWidthCm <= 0 || currentPixelSpan <= 0) return;
+    // F = (Pixel Span * Known Distance) / Target Real Width
+    const exactF = Math.round((currentPixelSpan * calibrationDistInput) / targetWidthCm);
+    setFocalLength(exactF);
+    localStorage.setItem('tyre_camera_focal_length', exactF.toString());
+    setIsCalibrated(true);
+    setCalibrationSuccess(true);
+    setTimeout(() => {
+      setCalibrationSuccess(false);
+      setShowCalibrationDrawer(false);
+    }, 1800);
+  };
+
+  const handleResetCalibration = () => {
+    localStorage.removeItem('tyre_camera_focal_length');
+    const autoF = videoRef.current?.videoWidth ? Math.round(videoRef.current.videoWidth * 0.714) : 650;
+    setFocalLength(autoF);
+    setIsCalibrated(false);
+  };
+
+  // Expected 17.5 cm corridor guide width
   const expectedPixelsAt17cm = Math.round((targetWidthCm * focalLength) / 17.5);
-  const corridorWidthPct = Math.min(85, Math.max(30, (expectedPixelsAt17cm / 1280) * 100));
+  const corridorWidthPct = Math.min(85, Math.max(30, (expectedPixelsAt17cm / videoNativeW) * 100));
 
   return (
     <div className="flex flex-col items-center min-h-screen bg-slate-950 text-slate-100 p-4 md:p-6 select-none font-sans">
@@ -306,9 +391,20 @@ export default function TyreGuidanceScanner() {
             <h1 className="text-xl md:text-2xl font-bold tracking-tight text-white">
               Tyre Guidance Scanner
             </h1>
-            <span className="text-[11px] text-emerald-400 font-semibold uppercase tracking-wider block">
-              Real-Time 15 – 20 cm Window Enforcement
-            </span>
+            <div className="flex items-center gap-2">
+              <span className="text-[11px] text-emerald-400 font-semibold uppercase tracking-wider">
+                15 – 20 cm Window Enforcement
+              </span>
+              {isCalibrated ? (
+                <span className="text-[10px] bg-emerald-950 text-emerald-300 border border-emerald-600 px-1.5 py-0.2 rounded font-bold">
+                  ✓ Lens Calibrated
+                </span>
+              ) : (
+                <span className="text-[10px] bg-amber-950 text-amber-300 border border-amber-600 px-1.5 py-0.2 rounded font-bold">
+                  ⚠ Uncalibrated
+                </span>
+              )}
+            </div>
           </div>
         </div>
 
@@ -382,7 +478,7 @@ export default function TyreGuidanceScanner() {
           </div>
         </div>
 
-        {/* 2. CAMERA FEED + 17.5 cm RETICLE CORRIDOR */}
+        {/* 2. CAMERA FEED + VISUAL EDGE OVERLAY & CORRIDOR */}
         <div
           ref={containerRef}
           className={`relative w-full aspect-[4/3] md:aspect-video bg-black rounded-2xl overflow-hidden border-2 transition-all duration-200 shadow-2xl ${
@@ -407,7 +503,7 @@ export default function TyreGuidanceScanner() {
             </div>
           )}
 
-          {/* VISUAL RETICLE CORRIDOR (17.5 cm Framing Guide) */}
+          {/* VISUAL 17.5 cm CORRIDOR BRACKETS (Dashed) */}
           <div className="absolute inset-0 pointer-events-none flex items-center justify-center z-10">
             <div
               style={{ width: `${corridorWidthPct}%`, height: '55%' }}
@@ -418,13 +514,51 @@ export default function TyreGuidanceScanner() {
               }`}
             >
               <div className="flex justify-between text-[10px] font-mono font-bold text-white/75">
-                <span>[ 17.5 cm CORRIDOR ]</span>
-                <span>TREAD TARGET</span>
+                <span>[ 17.5 cm TARGET ]</span>
+                <span>CORRIDOR</span>
               </div>
               <div className="text-center text-[11px] font-semibold text-white/80">
                 Fit tyre tread width between brackets
               </div>
             </div>
+          </div>
+
+          {/* REAL-TIME DETECTED EDGE MARKERS (Cyan Vertical Guidelines with Handles) */}
+          {/* Left Edge Guideline */}
+          <div
+            style={{ left: `${leftEdgeRatio * 100}%` }}
+            className="absolute top-0 bottom-0 w-1 bg-cyan-400 cursor-ew-resize z-20 flex items-center justify-center shadow-[0_0_12px_rgba(34,211,238,0.9)]"
+            onMouseDown={() => setDraggingHandle('left')}
+            onTouchStart={() => setDraggingHandle('left')}
+          >
+            <div className="w-6 h-12 bg-cyan-400 hover:bg-cyan-300 text-black font-extrabold text-xs rounded-full flex items-center justify-center shadow-lg select-none">
+              ◀
+            </div>
+          </div>
+
+          {/* Right Edge Guideline */}
+          <div
+            style={{ left: `${rightEdgeRatio * 100}%` }}
+            className="absolute top-0 bottom-0 w-1 bg-cyan-400 cursor-ew-resize z-20 flex items-center justify-center shadow-[0_0_12px_rgba(34,211,238,0.9)]"
+            onMouseDown={() => setDraggingHandle('right')}
+            onTouchStart={() => setDraggingHandle('right')}
+          >
+            <div className="w-6 h-12 bg-cyan-400 hover:bg-cyan-300 text-black font-extrabold text-xs rounded-full flex items-center justify-center shadow-lg select-none">
+              ▶
+            </div>
+          </div>
+
+          {/* Active Detected Span Bar */}
+          <div
+            style={{
+              left: `${leftEdgeRatio * 100}%`,
+              width: `${(rightEdgeRatio - leftEdgeRatio) * 100}%`,
+            }}
+            className="absolute top-14 h-8 border-t-2 border-b-2 border-cyan-400/80 bg-cyan-500/20 flex items-center justify-center pointer-events-none z-10 backdrop-blur-[1px]"
+          >
+            <span className="text-[11px] font-mono font-bold text-cyan-200">
+              Active Span: {Math.round(currentPixelSpan)} px
+            </span>
           </div>
 
           {/* REAL-TIME DISTANCE & GUIDANCE STATUS BANNER */}
@@ -448,7 +582,7 @@ export default function TyreGuidanceScanner() {
                   ? '⬅ MOVE BACK (TOO CLOSE)'
                   : currentZone === 'TOO_FAR'
                   ? '➡ MOVE CLOSER (TOO FAR)'
-                  : 'AIM AT TYRE TREAD'}
+                  : 'ALIGN TYRE EDGES'}
               </span>
             </div>
 
@@ -460,9 +594,9 @@ export default function TyreGuidanceScanner() {
             </div>
           </div>
 
-          {/* 3. SHARPNESS/FOCUS DETECTION & AUTO-RECORD GATING STATUS */}
+          {/* BOTTOM METRICS HUD */}
           <div className="absolute bottom-3 inset-x-3 z-30 flex items-center justify-between pointer-events-none">
-            {/* Sharpness (Laplacian Focus Engine) */}
+            {/* Focus/Sharpness */}
             <div className="bg-slate-950/85 border border-slate-800 px-2.5 py-1 rounded-lg flex items-center gap-1.5 text-xs backdrop-blur-sm">
               <Activity className="w-3.5 h-3.5 text-cyan-400" />
               <span className="text-slate-400 text-[11px]">Focus/Sharpness:</span>
@@ -492,6 +626,100 @@ export default function TyreGuidanceScanner() {
             )}
           </div>
         </div>
+
+        {/* 3. CALIBRATION & EDGE TUNING CONTROLS */}
+        <div className="bg-slate-900 border border-slate-800 p-3.5 rounded-2xl flex flex-wrap items-center justify-between gap-3 shadow-lg">
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setAutoEdgeTracking(!autoEdgeTracking)}
+              className={`px-3 py-1.5 rounded-lg text-xs font-semibold border transition ${
+                autoEdgeTracking
+                  ? 'bg-cyan-950/80 border-cyan-400 text-cyan-300'
+                  : 'bg-slate-800 border-slate-700 text-slate-300'
+              }`}
+            >
+              {autoEdgeTracking ? 'Auto-Edge Tracking: ON' : 'Manual Calipers: ACTIVE'}
+            </button>
+            <span className="text-[11px] text-slate-400 hidden sm:inline">
+              (Drag ◀ ▶ handles if edges don't match)
+            </span>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setShowCalibrationDrawer(!showCalibrationDrawer)}
+              className="px-3 py-1.5 rounded-lg text-xs font-bold bg-amber-500 hover:bg-amber-400 text-slate-950 transition flex items-center gap-1 shadow-md shadow-amber-950"
+            >
+              <Sliders className="w-3.5 h-3.5" />
+              {showCalibrationDrawer ? 'Hide Calibration' : 'Fix Distance with Ruler'}
+            </button>
+          </div>
+        </div>
+
+        {/* 1-CLICK CALIBRATION DRAWER */}
+        {showCalibrationDrawer && (
+          <div className="bg-amber-950/30 border-2 border-amber-600/50 p-4 rounded-2xl flex flex-col gap-3 shadow-xl transition">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-bold text-amber-300 flex items-center gap-1.5">
+                <Sliders className="w-4 h-4" /> 1-Click Lens Calibration (Eliminates Error)
+              </span>
+              <span className="text-xs font-mono text-amber-200">Current F: {focalLength} px</span>
+            </div>
+
+            <p className="text-xs text-amber-200/90 leading-relaxed">
+              Place your camera at an exact distance (e.g. 18 cm) from the tyre using a ruler, ensure the ◀ ▶
+              handles line up with the tyre edges, and click <strong>Lock Calibration</strong>.
+            </p>
+
+            <div className="flex flex-wrap items-center gap-3">
+              <label className="text-xs text-amber-200 flex items-center gap-1.5 font-medium">
+                Physical Distance from Lens (cm):
+                <input
+                  type="number"
+                  min="5"
+                  max="50"
+                  value={calibrationDistInput}
+                  onChange={(e) => setCalibrationDistInput(parseFloat(e.target.value) || 18)}
+                  className="w-20 bg-slate-950 border border-amber-700/60 rounded px-2.5 py-1 text-sm text-white font-mono"
+                />
+              </label>
+
+              <button
+                onClick={handleLockCalibration}
+                className="bg-amber-500 hover:bg-amber-400 text-slate-950 font-extrabold text-xs px-4 py-2 rounded-lg transition flex items-center gap-1.5 active:scale-95 shadow-md shadow-amber-950"
+              >
+                {calibrationSuccess ? (
+                  <>
+                    <CheckCircle2 className="w-4 h-4 text-emerald-950" /> Calibrated!
+                  </>
+                ) : (
+                  `Lock Calibration at ${calibrationDistInput} cm`
+                )}
+              </button>
+
+              <button
+                onClick={handleResetCalibration}
+                className="text-xs text-slate-400 hover:text-white underline ml-auto flex items-center gap-1"
+              >
+                <RotateCcw className="w-3.5 h-3.5" /> Reset Default
+              </button>
+            </div>
+
+            {/* Manual Focal Length Tuning Slider */}
+            <div className="pt-2 border-t border-amber-800/40 flex items-center gap-3 text-xs text-amber-200/80">
+              <span>Fine-Tune Focal Length (px):</span>
+              <input
+                type="range"
+                min="300"
+                max="1400"
+                value={focalLength}
+                onChange={(e) => setFocalLength(parseInt(e.target.value))}
+                className="flex-1 accent-amber-400"
+              />
+              <span className="font-mono text-white font-bold">{focalLength} px</span>
+            </div>
+          </div>
+        )}
 
         {/* 4. AUTO-RECORDING GATE CONTROLS */}
         <div className="bg-slate-900 border border-slate-800 p-4 rounded-2xl flex flex-wrap items-center justify-between gap-3 shadow-lg">
@@ -542,10 +770,10 @@ export default function TyreGuidanceScanner() {
         <div className="bg-slate-900 border border-slate-800 p-4 rounded-2xl flex flex-col gap-2.5">
           <div className="flex items-center justify-between">
             <span className="text-xs font-semibold text-slate-300 uppercase tracking-wider">
-              Tyre Nominal Width Preset
+              Tyre Nominal Width Setting
             </span>
             <span className="text-xs text-emerald-400 font-mono font-bold">
-              {targetWidthCm} cm ({targetWidthCm * 10} mm)
+              Current: {targetWidthCm} cm ({targetWidthCm * 10} mm)
             </span>
           </div>
 
